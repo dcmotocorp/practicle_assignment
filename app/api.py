@@ -2,14 +2,15 @@ from datetime import datetime
 from math import ceil
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from kombu.exceptions import OperationalError as BrokerOperationalError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+
 from app.models import Article, ArticleStatus
 from app.schemas import ArticleCreate, ArticleListResponse, ArticleResponse, ErrorResponse, Pagination
-from app.services.processor import process_article
 
 router = APIRouter(prefix="/articles", tags=["Articles"])
 
@@ -37,7 +38,6 @@ def conflict(message: str) -> HTTPException:
 )
 def create_article(
     payload: ArticleCreate,
-    background_tasks: BackgroundTasks,
     request: Request,
     db: DbSession,
 ) -> Article:
@@ -59,9 +59,18 @@ def create_article(
         db.rollback()
         raise conflict("An article with this URL already exists.") from exc
     db.refresh(article)
-    background_tasks.add_task(
-        process_article, article.id, request.app.state.database.session_factory
-    )
+    try:
+        request.app.state.dispatch_article(
+            article.id, request.app.state.database.session_factory
+        )
+    except BrokerOperationalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "TASK_BROKER_UNAVAILABLE",
+                "message": "The article was stored, but the processing queue is unavailable.",
+            },
+        ) from exc
     return article
 
 
